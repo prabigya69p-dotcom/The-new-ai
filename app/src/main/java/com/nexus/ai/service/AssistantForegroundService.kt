@@ -5,12 +5,14 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.provider.Settings
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import androidx.core.app.NotificationCompat
 import com.nexus.ai.MainActivity
 import com.nexus.ai.audio.AudioPipelineManager
-import com.nexus.ai.audio.AudioState
+import com.nexus.ai.audio.AudioStateManager
+import com.nexus.ai.audio.WakeWordEngine
 import com.nexus.ai.ui.OverlayViewManager
 import kotlinx.coroutines.*
 import java.util.Locale
@@ -21,24 +23,39 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
     private lateinit var overlay: OverlayViewManager
     private lateinit var tts: TextToSpeech
 
+    // Adapter boundary for your actual local engine (openWakeWord/Porcupine).
+    // It receives PCM from the single AudioRecord owned by AudioPipelineManager.
+    private val wakeWordEngine = object : WakeWordEngine {
+        private var enabled = false
+        override fun start() { enabled = true }
+        override fun stop() { enabled = false }
+        override fun acceptPcm(pcm: ShortArray, sampleRate: Int) {
+            if (!enabled) return
+            // Plug the chosen local wake-word SDK here.
+            // Never instantiate another AudioRecord in this callback.
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
-
         createNotificationChannel()
+
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
             .setContentTitle("Nexus")
-            .setContentText("Hands-free assistant is listening")
+            .setContentText("Hands-free assistant is active")
             .setOngoing(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setContentIntent(
+                PendingIntent.getActivity(
+                    this, 0, Intent(this, MainActivity::class.java),
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+            )
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID,
-                notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
-            )
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
@@ -49,29 +66,25 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         audio = AudioPipelineManager(
             context = this,
             scope = serviceScope,
-            onPcmAudio = { pcm, sampleRate ->
-                // Feed this PCM stream to your local wake-word engine.
-                // Keep this callback lightweight; all work is already off the UI thread.
-                wakeWordEngine.acceptPcm(pcm, sampleRate)
-            },
+            wakeWordEngine = wakeWordEngine,
             onStateChanged = { state ->
                 when (state) {
-                    AudioState.IDLE_LISTENING -> overlay.update("Listening…")
-                    AudioState.RECORDING_USER -> overlay.update("Listening to you…")
-                    AudioState.PROCESSING -> overlay.update("Thinking…")
-                    AudioState.SPEAKING -> overlay.update("Speaking…")
+                    AudioStateManager.IDLE_LISTENING -> overlay.update("Listening…")
+                    AudioStateManager.RECORDING_USER -> overlay.update("Listening to you…")
+                    AudioStateManager.PROCESSING -> overlay.update("Thinking…")
+                    AudioStateManager.SPEAKING -> overlay.update("Speaking…")
                 }
             }
         )
 
         tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
+                // Belt-and-suspenders: capture is already paused before speak().
                 audio.pauseForSpeech()
                 overlay.update("Speaking…")
             }
 
             override fun onDone(utteranceId: String?) {
-                // Only resume capture after TTS has fully stopped.
                 serviceScope.launch(Dispatchers.Main.immediate) {
                     audio.resumeAfterSpeech()
                     overlay.update("Listening…")
@@ -86,32 +99,16 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
             }
         })
 
-        if (android.provider.Settings.canDrawOverlays(this)) overlay.show("Listening…")
+        if (Settings.canDrawOverlays(this)) overlay.show("Listening…")
         audio.start()
     }
 
-    /**
-     * Call this when the assistant has generated a final answer.
-     * pauseForSpeech() is also called immediately by the utterance callback,
-     * preventing TTS audio from reaching the wake-word detector.
-     */
     fun speak(text: String) {
+        // Stop the microphone BEFORE TTS starts. This is the critical
+        // anti-feedback transition.
         audio.pauseForSpeech()
         overlay.update("Speaking…")
-        tts.speak(
-            text.take(2500),
-            TextToSpeech.QUEUE_FLUSH,
-            null,
-            UTTERANCE_ID
-        )
-    }
-
-    private val wakeWordEngine = object {
-        fun acceptPcm(pcm: ShortArray, sampleRate: Int) {
-            // Adapter boundary for openWakeWord / Porcupine.
-            // Do not run a second AudioRecord here.
-            // The engine must emit onWakeWordDetected() from this same PCM stream.
-        }
+        tts.speak(text.take(2500), TextToSpeech.QUEUE_FLUSH, null, UTTERANCE_ID)
     }
 
     override fun onInit(status: Int) {
@@ -120,9 +117,7 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        return START_STICKY
-    }
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
 
     override fun onDestroy() {
         audio.stop()
@@ -137,15 +132,12 @@ class AssistantForegroundService : Service(), TextToSpeech.OnInitListener {
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
                 NotificationChannel(
                     CHANNEL_ID,
                     "Nexus microphone",
                     NotificationManager.IMPORTANCE_LOW
-                ).apply {
-                    description = "Persistent notification for Nexus hands-free listening"
-                }
+                )
             )
         }
     }

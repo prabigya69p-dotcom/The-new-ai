@@ -4,24 +4,36 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.*
-import android.os.Build
-import android.util.Log
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 import java.util.concurrent.atomic.AtomicBoolean
 
-enum class AudioState {
+/**
+ * Single-owner microphone pipeline.
+ *
+ * The important rule is that Nexus owns exactly one AudioRecord. Wake-word
+ * detection consumes the PCM produced here; it must never create a second
+ * microphone capture loop.
+ */
+enum class AudioStateManager {
     IDLE_LISTENING,
     RECORDING_USER,
     PROCESSING,
     SPEAKING
 }
 
+interface WakeWordEngine {
+    fun start()
+    fun stop()
+    fun acceptPcm(pcm: ShortArray, sampleRate: Int)
+}
+
 class AudioPipelineManager(
     private val context: Context,
     private val scope: CoroutineScope,
-    private val onPcmAudio: suspend (ShortArray, Int) -> Unit,
-    private val onStateChanged: (AudioState) -> Unit
+    private val wakeWordEngine: WakeWordEngine,
+    private val onPcmAudio: suspend (ShortArray, Int) -> Unit = { _, _ -> },
+    private val onStateChanged: (AudioStateManager) -> Unit
 ) {
     private var audioRecord: AudioRecord? = null
     private var aec: AcousticEchoCanceler? = null
@@ -31,88 +43,85 @@ class AudioPipelineManager(
     private val paused = AtomicBoolean(false)
 
     @Volatile
-    var state: AudioState = AudioState.IDLE_LISTENING
+    var state: AudioStateManager = AudioStateManager.IDLE_LISTENING
         private set
 
     fun start() {
-        if (running.get()) return
+        if (running.getAndSet(true)) return
         if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED) {
-            Log.w(TAG, "RECORD_AUDIO permission is not granted")
+            running.set(false)
             return
         }
 
-        running.set(true)
         paused.set(false)
-        setState(AudioState.IDLE_LISTENING)
-
-        recordingJob = scope.launch(Dispatchers.IO) {
-            runRecordingLoop()
-        }
+        wakeWordEngine.start()
+        setState(AudioStateManager.IDLE_LISTENING)
+        recordingJob = scope.launch(Dispatchers.IO) { runRecordingLoop() }
     }
 
-    /**
-     * Immediately stops audio capture and wake-word processing.
-     * This is called before TTS starts so speaker output cannot retrigger the assistant.
-     */
+    /** Immediately tears down capture and wake-word processing before TTS. */
     fun pauseForSpeech() {
         paused.set(true)
+        wakeWordEngine.stop()
         releaseAudioRecord()
-        setState(AudioState.SPEAKING)
+        setState(AudioStateManager.SPEAKING)
     }
 
-    /**
-     * Recreates the capture chain after TTS has completely finished.
-     */
+    /** Called only after TTS onDone/onError. */
     fun resumeAfterSpeech() {
         if (!running.get()) return
         paused.set(false)
+        wakeWordEngine.start()
         if (recordingJob?.isActive != true) {
             recordingJob = scope.launch(Dispatchers.IO) { runRecordingLoop() }
         }
-        setState(AudioState.IDLE_LISTENING)
+        setState(AudioStateManager.IDLE_LISTENING)
     }
 
     fun setRecordingUser(recording: Boolean) {
         if (!running.get() || paused.get()) return
-        setState(if (recording) AudioState.RECORDING_USER else AudioState.IDLE_LISTENING)
+        setState(if (recording) AudioStateManager.RECORDING_USER else AudioStateManager.IDLE_LISTENING)
     }
 
     fun setProcessing() {
-        if (!paused.get()) setState(AudioState.PROCESSING)
+        if (!paused.get()) setState(AudioStateManager.PROCESSING)
     }
 
     fun stop() {
         running.set(false)
         paused.set(true)
+        wakeWordEngine.stop()
         recordingJob?.cancel()
         recordingJob = null
         releaseAudioRecord()
-        setState(AudioState.IDLE_LISTENING)
+        setState(AudioStateManager.IDLE_LISTENING)
     }
 
     private suspend fun runRecordingLoop() {
         try {
             createAudioRecord()
-
             val record = audioRecord ?: return
             val buffer = ShortArray(BUFFER_SAMPLES)
 
             while (currentCoroutineContext().isActive && running.get()) {
-                if (paused.get() || state == AudioState.SPEAKING) {
+                if (paused.get() || state == AudioStateManager.SPEAKING) {
                     delay(20)
                     continue
                 }
 
                 val count = record.read(buffer, 0, buffer.size, AudioRecord.READ_BLOCKING)
-                if (count > 0 && !paused.get() && state != AudioState.SPEAKING) {
-                    onPcmAudio(buffer.copyOf(count), SAMPLE_RATE)
+                if (count > 0 && !paused.get() && state != AudioStateManager.SPEAKING) {
+                    val pcm = buffer.copyOf(count)
+                    wakeWordEngine.acceptPcm(pcm, SAMPLE_RATE)
+                    onPcmAudio(pcm, SAMPLE_RATE)
                 }
             }
         } catch (cancelled: CancellationException) {
             throw cancelled
-        } catch (t: Throwable) {
-            Log.e(TAG, "Audio loop stopped", t)
+        } catch (_: Throwable) {
+            // The service can restart the pipeline if Android/audio hardware
+            // temporarily revokes the input device.
         } finally {
             releaseAudioRecord()
         }
@@ -121,24 +130,16 @@ class AudioPipelineManager(
     private fun createAudioRecord() {
         releaseAudioRecord()
 
-        val source = when {
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.N &&
-                AudioRecord.getMinBufferSize(
-                    SAMPLE_RATE,
-                    CHANNEL_CONFIG,
-                    AUDIO_FORMAT
-                ) > 0 -> MediaRecorder.AudioSource.VOICE_RECOGNITION
-            else -> MediaRecorder.AudioSource.VOICE_RECOGNITION
-        }
-
         val minBuffer = AudioRecord.getMinBufferSize(
             SAMPLE_RATE,
             CHANNEL_CONFIG,
             AUDIO_FORMAT
         ).coerceAtLeast(BUFFER_SAMPLES * 2)
 
+        // VOICE_RECOGNITION is preferred for assistant input because OEMs may
+        // provide voice-oriented DSP. AEC/NS are explicitly attached below.
         val record = AudioRecord(
-            source,
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
             SAMPLE_RATE,
             CHANNEL_CONFIG,
             AUDIO_FORMAT,
@@ -151,7 +152,6 @@ class AudioPipelineManager(
 
         audioRecord = record
 
-        // AEC/NS must be attached to the AudioRecord session, not guessed globally.
         if (AcousticEchoCanceler.isAvailable()) {
             aec = AcousticEchoCanceler.create(record.audioSessionId)?.apply {
                 enabled = true
@@ -179,13 +179,12 @@ class AudioPipelineManager(
         audioRecord = null
     }
 
-    private fun setState(newState: AudioState) {
+    private fun setState(newState: AudioStateManager) {
         state = newState
         onStateChanged(newState)
     }
 
     companion object {
-        private const val TAG = "NexusAudio"
         const val SAMPLE_RATE = 16_000
         private const val CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO
         private const val AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT
