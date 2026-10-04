@@ -2,11 +2,14 @@ package com.nexus.ai
 
 import android.Manifest
 import android.app.Activity
-import android.content.SharedPreferences
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
@@ -14,6 +17,8 @@ import android.speech.tts.TextToSpeech
 import android.view.Gravity
 import android.view.View
 import android.widget.*
+import androidx.core.content.ContextCompat
+import com.nexus.ai.service.AssistantForegroundService
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -42,6 +47,45 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
         tts = TextToSpeech(this, this)
         buildUi()
         addMessage("Nexus", "I'm ready. Add your Gemini API key in Settings, then ask me anything.")
+        ensureAssistantPermissions()
+    }
+
+    private fun ensureAssistantPermissions() {
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_AUDIO)
+        } else {
+            startAssistantService()
+        }
+    }
+
+    private fun startAssistantService() {
+        if (!Settings.canDrawOverlays(this)) {
+            status.text = "OVERLAY PERMISSION"
+            addMessage("Nexus", "Allow 'Display over other apps' for Nexus to show its hands-free popup.")
+            startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, Uri.parse("package:$packageName")))
+            return
+        }
+
+        val intent = Intent(this, AssistantForegroundService::class.java)
+        ContextCompat.startForegroundService(this, intent)
+        status.text = "LISTENING…"
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, results: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, results)
+        if (requestCode == REQUEST_AUDIO &&
+            results.firstOrNull() == PackageManager.PERMISSION_GRANTED) {
+            startAssistantService()
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (::status.isInitialized &&
+            checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED &&
+            Settings.canDrawOverlays(this)) {
+            startAssistantService()
+        }
     }
 
     private fun buildUi() {
@@ -198,7 +242,7 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             return
         }
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO),40)
+            requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), REQUEST_AUDIO)
             return
         }
         speechRecognizer?.destroy()
@@ -224,11 +268,10 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             override fun onPartialResults(partialResults: Bundle?) {}
             override fun onEvent(eventType: Int, params: Bundle?) {}
         })
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+        speechRecognizer?.startListening(Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE,Locale.getDefault())
-        }
-        speechRecognizer?.startListening(intent)
+        })
     }
 
     private fun speak(message: String) {
@@ -287,10 +330,13 @@ class MainActivity : Activity(), TextToSpeech.OnInitListener {
             }
             return out.toString().trim().ifEmpty { "The model returned no text." }
         }
-
         private fun extractError(raw: String): String = try {
             JSONObject(raw).optJSONObject("error")?.optString("message").orEmpty()
                 .ifEmpty { raw.take(300) }
         } catch (_: Exception) { raw.take(300) }
+    }
+
+    companion object {
+        private const val REQUEST_AUDIO = 40
     }
 }
