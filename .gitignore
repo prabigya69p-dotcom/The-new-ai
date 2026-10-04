@@ -1,0 +1,16 @@
+*.iml
+.gradle/
+.idea/
+.DS_Store
+build/
+app/build/
+.build-outputs/
+captures/
+.externalNativeBuild/
+.cxx/
+local.properties
+debug.keystore
+debug.keystore.base64
+.env
+.dev.env.json
+metadata.json
